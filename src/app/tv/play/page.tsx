@@ -12,6 +12,13 @@ import TVNativeVideo from '@/components/tv/player/TVNativeVideo';
 import { fetchTVDetail, formatTVTime, resolveTVEpisodeUrl } from '@/components/tv/player/utils';
 import TVVirtualRemote from '@/components/tv/TVVirtualRemote';
 
+const TV_DANMAKU_LANES = 8;
+const TV_DANMAKU_SPAWN_GRACE = 0.6;
+
+function getTVDanmakuDuration(text: string) {
+  return Math.max(6, 12 - Math.min(6, text.length / 6));
+}
+
 function TVPlayClient() {
   const router = useRouter();
   const searchParams = useSearchParams();
@@ -32,6 +39,7 @@ function TVPlayClient() {
   const [episodePage, setEpisodePage] = useState(0);
   const [playbackError, setPlaybackError] = useState(false);
   const [isPlaying, setIsPlaying] = useState(false);
+  const [isBuffering, setIsBuffering] = useState(false);
   const [favorited, setFavorited] = useState(false);
   const [muted, setMuted] = useState(false);
   const [volume, setVolume] = useState(1);
@@ -48,6 +56,14 @@ function TVPlayClient() {
     return saved === null ? true : saved === 'true';
   });
   const [danmakuItems, setDanmakuItems] = useState<Array<{ text: string; time: number; color: string; mode: number }>>([]);
+  const [activeDanmakuItems, setActiveDanmakuItems] = useState<Array<{
+    id: string;
+    text: string;
+    time: number;
+    color: string;
+    duration: number;
+    lane: number;
+  }>>([]);
   const [playbackRate, setPlaybackRate] = useState(() => {
     if (typeof window === 'undefined') return 1;
     return Number(localStorage.getItem('tv_playback_rate') || '1') || 1;
@@ -61,6 +77,8 @@ function TVPlayClient() {
   const idleTimerRef = useRef<number | null>(null);
   const volumeHintTimerRef = useRef<number | null>(null);
   const seekHintTimerRef = useRef<number | null>(null);
+  const spawnedDanmakuRef = useRef<Set<string>>(new Set());
+  const lastDanmakuTimeRef = useRef(0);
   const skippedIntroRef = useRef('');
   const skippedOutroRef = useRef('');
   const lastSavedRef = useRef<{
@@ -153,6 +171,9 @@ function TVPlayClient() {
     let alive = true;
     async function loadDanmaku() {
       setDanmakuItems([]);
+      setActiveDanmakuItems([]);
+      spawnedDanmakuRef.current.clear();
+      lastDanmakuTimeRef.current = timeRef.current.current;
       if (!danmakuEnabled || !detail?.title) return;
       try {
         const search = await searchAnime(title || detail.title);
@@ -176,6 +197,51 @@ function TVPlayClient() {
     loadDanmaku();
     return () => { alive = false; };
   }, [danmakuEnabled, detail?.title, episodeIndex, title]);
+
+  useEffect(() => {
+    if (!danmakuEnabled || danmakuItems.length === 0) {
+      setActiveDanmakuItems([]);
+      spawnedDanmakuRef.current.clear();
+      lastDanmakuTimeRef.current = time.current;
+      return;
+    }
+
+    const current = time.current;
+    const previous = lastDanmakuTimeRef.current;
+    const jumped = current < previous - 1 || current - previous > 2;
+    const spawnWindow = jumped ? TV_DANMAKU_SPAWN_GRACE : Math.max(TV_DANMAKU_SPAWN_GRACE, current - previous + 0.2);
+
+    const spawned = spawnedDanmakuRef.current;
+    const nextItems = danmakuItems
+      .map((item, index) => {
+        const id = `${index}-${item.time}-${item.text}`;
+        return {
+          id,
+          text: item.text,
+          time: item.time,
+          color: item.color,
+          duration: getTVDanmakuDuration(item.text),
+          lane: index % TV_DANMAKU_LANES,
+        };
+      })
+      .filter((item) => {
+        const lateBy = current - item.time;
+        return lateBy >= 0 && lateBy <= spawnWindow && !spawned.has(item.id);
+      })
+      .slice(0, TV_DANMAKU_LANES);
+
+    if (nextItems.length > 0) {
+      nextItems.forEach((item) => spawned.add(item.id));
+    }
+
+    setActiveDanmakuItems((prev) => {
+      if (jumped) return nextItems;
+      if (nextItems.length === 0) return prev;
+      return [...prev, ...nextItems];
+    });
+
+    lastDanmakuTimeRef.current = current;
+  }, [danmakuEnabled, danmakuItems, time.current]);
 
   useEffect(() => {
     if (!detail?.source || !detail?.id) return;
@@ -376,6 +442,8 @@ function TVPlayClient() {
     revealPanel();
     setShowEpisodes(false);
     setLoading(true);
+    setIsBuffering(false);
+    const currentPlayTime = Math.floor(timeRef.current.current || 0);
     try {
       let next = item;
       if (!item.episodes?.length) {
@@ -385,7 +453,7 @@ function TVPlayClient() {
       const targetIndex = Math.max(0, Math.min(episodeIndex, Math.max(0, (next.episodes?.length || 1) - 1)));
       setDetail(next);
       setEpisodeIndex(targetIndex);
-      setStartTime(0);
+      setStartTime(currentPlayTime > 1 ? currentPlayTime : 0);
       setEpisodePage(Math.floor(targetIndex / 30));
     } catch (err) {
       setError(err instanceof Error ? err.message : '切换播放源失败');
@@ -524,19 +592,23 @@ function TVPlayClient() {
 
   return (
     <main data-tv-player-root className='fixed inset-0 overflow-hidden bg-black text-white'>
-      {videoUrl ? <TVNativeVideo key={`${videoUrl}-${retryNonce}`} url={videoUrl} poster={detail.poster} title={detail.title} onTime={onTime} command={toggleCommand} startTime={startTime} onError={() => setPlaybackError(true)} onPlayingChange={setIsPlaying} adFilterEnabled={adFilterEnabled} playbackRate={playbackRate} /> : (
+      {videoUrl ? <TVNativeVideo key={`${videoUrl}-${retryNonce}`} url={videoUrl} poster={detail.poster} title={detail.title} onTime={onTime} command={toggleCommand} startTime={startTime} onError={() => setPlaybackError(true)} onPlayingChange={setIsPlaying} onBufferingChange={setIsBuffering} adFilterEnabled={adFilterEnabled} playbackRate={playbackRate} /> : (
         <div className='flex h-full w-full items-center justify-center text-3xl font-bold text-white'><Loader2 className='mr-4 h-10 w-10 animate-spin text-rose-500' />{resolving ? '正在解析播放地址...' : '准备播放...'}</div>
       )}
-      {danmakuEnabled && danmakuItems.length > 0 && (
+      {activeDanmakuItems.length > 0 && (
         <div className='pointer-events-none absolute inset-x-0 top-12 z-10 h-[42vh] overflow-hidden'>
-          {danmakuItems.filter((item) => Math.abs(item.time - time.current) < 0.35).slice(0, 8).map((item, idx) => (
+          {activeDanmakuItems.map((item) => (
             <div
-              key={`${item.time}-${idx}-${item.text}`}
+              key={item.id}
               className='absolute whitespace-nowrap text-3xl font-black drop-shadow-[0_2px_4px_rgba(0,0,0,0.9)]'
+              onAnimationEnd={() => {
+                setActiveDanmakuItems((prev) => prev.filter((active) => active.id !== item.id));
+              }}
               style={{
-                top: `${(idx % 8) * 12}%`,
+                top: `${item.lane * 12}%`,
                 color: item.color || '#fff',
-                animation: `tv-danmaku ${Math.max(6, 12 - Math.min(6, item.text.length / 6))}s linear forwards`,
+                animation: `tv-danmaku ${item.duration}s linear forwards`,
+                animationPlayState: isPlaying && !isBuffering ? 'running' : 'paused',
               }}
             >
               {item.text}

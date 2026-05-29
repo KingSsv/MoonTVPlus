@@ -56,6 +56,7 @@ export default function TVNativeVideo({
   onTime,
   onError: onPlaybackError,
   onPlayingChange,
+  onBufferingChange,
   adFilterEnabled = false,
   playbackRate = 1,
   startTime = 0,
@@ -69,6 +70,7 @@ export default function TVNativeVideo({
   onTime?: (current: number, duration: number) => void;
   onError?: () => void;
   onPlayingChange?: (playing: boolean) => void;
+  onBufferingChange?: (buffering: boolean) => void;
   adFilterEnabled?: boolean;
   playbackRate?: number;
   startTime?: number;
@@ -79,7 +81,11 @@ export default function TVNativeVideo({
   const onTimeRef = useRef<typeof onTime>(onTime);
   const onPlaybackErrorRef = useRef<typeof onPlaybackError>(onPlaybackError);
   const onPlayingChangeRef = useRef<typeof onPlayingChange>(onPlayingChange);
+  const onBufferingChangeRef = useRef<typeof onBufferingChange>(onBufferingChange);
+  const bufferingTimerRef = useRef<number | null>(null);
+  const bufferingStateRef = useRef(false);
   const [loading, setLoading] = useState(false);
+  const [buffering, setBuffering] = useState(false);
   const [playing, setPlaying] = useState(false);
   const [error, setError] = useState('');
 
@@ -96,12 +102,19 @@ export default function TVNativeVideo({
   }, [onPlayingChange]);
 
   useEffect(() => {
+    onBufferingChangeRef.current = onBufferingChange;
+  }, [onBufferingChange]);
+
+  useEffect(() => {
     const video = videoRef.current;
     if (!video || !url) return;
     const videoEl = video;
 
     let disposed = false;
     setLoading(true);
+    bufferingStateRef.current = false;
+    setBuffering(false);
+    onBufferingChangeRef.current?.(false);
     setError('');
     setPlaying(false);
 
@@ -122,6 +135,31 @@ export default function TVNativeVideo({
       videoEl.play().catch(() => {
         // 浏览器阻止自动播放时，等待用户按 OK/点击播放
       });
+    };
+
+    const setBufferingState = (next: boolean) => {
+      if (bufferingStateRef.current === next) return;
+      bufferingStateRef.current = next;
+      setBuffering(next);
+      onBufferingChangeRef.current?.(next);
+    };
+
+    const clearBuffering = () => {
+      if (bufferingTimerRef.current) {
+        window.clearTimeout(bufferingTimerRef.current);
+        bufferingTimerRef.current = null;
+      }
+      setBufferingState(false);
+    };
+
+    const scheduleBuffering = () => {
+      if (videoEl.paused || videoEl.ended || bufferingTimerRef.current) return;
+      bufferingTimerRef.current = window.setTimeout(() => {
+        bufferingTimerRef.current = null;
+        if (!videoEl.paused && !videoEl.ended && videoEl.readyState < HTMLMediaElement.HAVE_FUTURE_DATA) {
+          setBufferingState(true);
+        }
+      }, 700);
     };
 
     async function attach() {
@@ -212,27 +250,46 @@ export default function TVNativeVideo({
     const onLoaded = () => {
       seekToInitialTime();
       setLoading(false);
+      clearBuffering();
     };
     const onPlay = () => {
       setPlaying(true);
+      clearBuffering();
+      onPlayingChangeRef.current?.(true);
+    };
+    const onPlaying = () => {
+      setPlaying(true);
+      clearBuffering();
       onPlayingChangeRef.current?.(true);
     };
     const onPause = () => {
       setPlaying(false);
+      clearBuffering();
       onPlayingChangeRef.current?.(false);
     };
+    const onBuffering = () => scheduleBuffering();
     const onError = () => {
       setLoading(false);
+      clearBuffering();
       setError('视频加载失败，请尝试切换线路或频道');
       onPlaybackErrorRef.current?.();
     };
-    const onTimeUpdate = () => onTimeRef.current?.(videoEl.currentTime || 0, videoEl.duration || 0);
+    const onTimeUpdate = () => {
+      clearBuffering();
+      onTimeRef.current?.(videoEl.currentTime || 0, videoEl.duration || 0);
+    };
 
     videoEl.addEventListener('loadedmetadata', seekToInitialTime);
     videoEl.addEventListener('loadeddata', onLoaded);
     videoEl.addEventListener('canplay', onLoaded);
+    videoEl.addEventListener('canplaythrough', onLoaded);
     videoEl.addEventListener('play', onPlay);
+    videoEl.addEventListener('playing', onPlaying);
     videoEl.addEventListener('pause', onPause);
+    videoEl.addEventListener('waiting', onBuffering);
+    videoEl.addEventListener('stalled', onBuffering);
+    videoEl.addEventListener('seeking', onBuffering);
+    videoEl.addEventListener('seeked', onLoaded);
     videoEl.addEventListener('error', onError);
     videoEl.addEventListener('timeupdate', onTimeUpdate);
 
@@ -241,10 +298,17 @@ export default function TVNativeVideo({
       videoEl.removeEventListener('loadedmetadata', seekToInitialTime);
       videoEl.removeEventListener('loadeddata', onLoaded);
       videoEl.removeEventListener('canplay', onLoaded);
+      videoEl.removeEventListener('canplaythrough', onLoaded);
       videoEl.removeEventListener('play', onPlay);
+      videoEl.removeEventListener('playing', onPlaying);
       videoEl.removeEventListener('pause', onPause);
+      videoEl.removeEventListener('waiting', onBuffering);
+      videoEl.removeEventListener('stalled', onBuffering);
+      videoEl.removeEventListener('seeking', onBuffering);
+      videoEl.removeEventListener('seeked', onLoaded);
       videoEl.removeEventListener('error', onError);
       videoEl.removeEventListener('timeupdate', onTimeUpdate);
+      clearBuffering();
       cleanup();
     };
   }, [url, live, startTime, adFilterEnabled, playbackRate]);
@@ -278,9 +342,12 @@ export default function TVNativeVideo({
         onClick={toggle}
         aria-label={title || 'TV 视频播放器'}
       />
-      {loading && (
-        <div className='pointer-events-none absolute inset-0 flex items-center justify-center bg-black/35 text-2xl font-bold text-white'>
-          <Loader2 className='mr-3 h-9 w-9 animate-spin text-rose-500' /> 正在缓冲...
+      {(loading || buffering) && (
+        <div className='pointer-events-none absolute inset-0 flex items-center justify-center bg-black/35 text-white'>
+          <div className='flex items-center gap-3 rounded-2xl border border-white/12 bg-black/55 px-6 py-4 text-2xl font-bold shadow-2xl shadow-black/50 backdrop-blur-md'>
+            <Loader2 className='h-9 w-9 animate-spin text-rose-500' />
+            <span>{buffering ? '缓冲中' : '正在载入'}</span>
+          </div>
         </div>
       )}
       {error && (
